@@ -61,13 +61,21 @@ logger = logging.getLogger("otp-bot")
 db = None
 if MONGO_URI:
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        # Trigger connection check
-        client.server_info()
+        # Enhanced connection with better timeout and retry settings
+        client = MongoClient(
+            MONGO_URI, 
+            serverSelectionTimeoutMS=10000,  # Increased timeout
+            connectTimeoutMS=10000,
+            socketTimeoutMS=10000,
+            retryWrites=True,
+            appname="otp-bot"
+        )
+        # Test connection with longer timeout
+        client.admin.command('ping')
         db = client["otpbot"]
-        logger.info("Connected to MongoDB")
+        logger.info("✅ Connected to MongoDB successfully")
     except Exception as e:
-        logger.warning("Could not connect to MongoDB, falling back to local JSON state. Error: %s", e)
+        logger.warning("❌ Could not connect to MongoDB, falling back to local JSON state. Error: %s", e)
         db = None
 
 # In-memory state (source of truth during runtime; persisted to DB or JSON)
@@ -95,9 +103,9 @@ def _load_state_from_db():
             # convert admin list to set
             state["admins"] = set(data.get("admins", []))
             state["admins"].add(OWNER_ID)
-            logger.info("Loaded state from MongoDB")
+            logger.info("✅ Loaded state from MongoDB")
     except Exception as e:
-        logger.error("Error loading state from DB: %s", e)
+        logger.error("❌ Error loading state from DB: %s", e)
 
 def _save_state_to_db():
     if db is None:
@@ -109,7 +117,7 @@ def _save_state_to_db():
         }
         db.settings.update_one({"_id": "state"}, {"$set": {"data": data}}, upsert=True)
     except Exception as e:
-        logger.error("Error saving state to DB: %s", e)
+        logger.error("❌ Error saving state to DB: %s", e)
 
 def _load_state_from_file():
     global state
@@ -120,9 +128,9 @@ def _load_state_from_file():
                 state["groups"] = data.get("groups", {})
                 state["admins"] = set(data.get("admins", []))
                 state["admins"].add(OWNER_ID)
-                logger.info("Loaded state from local file")
+                logger.info("✅ Loaded state from local file")
         except Exception as e:
-            logger.error("Error loading local state file: %s", e)
+            logger.error("❌ Error loading local state file: %s", e)
 
 def _save_state_to_file():
     try:
@@ -130,11 +138,26 @@ def _save_state_to_file():
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
     except Exception as e:
-        logger.error("Error saving local state file: %s", e)
+        logger.error("❌ Error saving local state file: %s", e)
 
 def load_state():
+    """Load state with fallback mechanisms"""
+    max_retries = 3
+    retry_delay = 2
+    
     if db is not None:
-        _load_state_from_db()
+        for attempt in range(max_retries):
+            try:
+                _load_state_from_db()
+                logger.info("✅ State loaded from MongoDB")
+                return
+            except Exception as e:
+                logger.warning("Attempt %s/%s failed: %s", attempt + 1, max_retries, e)
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+        
+        logger.error("❌ All MongoDB attempts failed, falling back to local file")
+        _load_state_from_file()
     else:
         _load_state_from_file()
 
@@ -146,6 +169,22 @@ def save_state():
 
 def is_admin(user_id: int) -> bool:
     return (user_id in state["admins"]) or (user_id == state["owner"])
+
+def test_mongodb_connection():
+    """Test MongoDB connection with detailed error reporting"""
+    if not MONGO_URI:
+        return "❌ No MONGO_URI provided"
+    
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(MONGO_URI)
+        logger.info("🔍 MongoDB host: %s", parsed.hostname)
+        
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        client.server_info()
+        return "✅ MongoDB connection successful"
+    except Exception as e:
+        return f"❌ MongoDB connection failed: {str(e)}"
 
 # ---------- Message formatting / parsing ----------
 def extract_otp(message: str) -> str:
@@ -267,9 +306,9 @@ async def send_to_all_groups(app, text: str):
             g["messages"] = g.get("messages", 0) + 1
             # persist after each successful send (keeps counts safe)
             save_state()
-            logger.info("Sent to %s (total %s)", cid_str, g["messages"])
+            logger.info("✅ Sent to %s (total %s)", cid_str, g["messages"])
         except Exception as e:
-            logger.warning("Failed to send to %s: %s", cid_str, e)
+            logger.warning("❌ Failed to send to %s: %s", cid_str, e)
 
 # ---------------- Bot Commands ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,6 +326,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removeadmin &lt;user_id&gt;  (owner only)\n"
         "/status\n"
         "/stats\n"
+        "/testdb - Test MongoDB connection\n"
         "/help\n"
     )
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
@@ -382,6 +422,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Admins: <b>{admins_count}</b>\n"
         f"• Uptime: <b>{uptime}</b>\n"
         f"• Total messages sent: <b>{total_msgs}</b>\n"
+        f"• Storage: <b>{'MongoDB' if db else 'Local JSON'}</b>\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -403,6 +444,14 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /broadcast <text> or reply to a message with /broadcast")
     await send_to_all_groups(context.application, msg)
     await update.message.reply_text("✅ Broadcast sent")
+
+async def cmd_test_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test MongoDB connection"""
+    if not is_admin(update.effective_user.id):
+        return await update.message.reply_text("⛔ You are not admin")
+    
+    result = test_mongodb_connection()
+    await update.message.reply_text(f"📊 Database Test:\n{result}")
 
 # ---------------- CallbackQuery (placeholder) ----------------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,7 +529,12 @@ async def on_startup(app):
     # start background worker
     # use create_task so run_polling can proceed
     asyncio.create_task(otp_worker(app))
-    logger.info("Bot startup complete. Owner: %s", OWNER_ID)
+    logger.info("✅ Bot startup complete. Owner: %s", OWNER_ID)
+    
+    # Test MongoDB connection on startup
+    if MONGO_URI:
+        result = test_mongodb_connection()
+        logger.info(result)
 
 # ---------------- Main ----------------
 def main():
@@ -497,12 +551,13 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("testdb", cmd_test_db))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # Chat member handler to detect when bot is added to groups
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    logger.info("Starting bot polling...")
+    logger.info("🚀 Starting bot polling...")
     app.run_polling()
 
 if __name__ == "__main__":
