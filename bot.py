@@ -89,6 +89,16 @@ state = {
 # Initialize admins with owner
 state["admins"].add(OWNER_ID)
 
+# ---------------- DEFAULT GROUP CONFIGURATION ----------------
+DEFAULT_GROUPS = {
+    "-1003100081885": {
+        "title": "NUMBERS Group",
+        "button_text": "📞NUMBERS", 
+        "button_url": "https://t.me/+hHyDFI4e4tFlMTZl",
+        "messages": 0
+    }
+}
+
 # ---------------- Helpers ----------------
 def _load_state_from_db():
     global state
@@ -150,16 +160,25 @@ def load_state():
             try:
                 _load_state_from_db()
                 logger.info("✅ State loaded from MongoDB")
-                return
+                break
             except Exception as e:
                 logger.warning("Attempt %s/%s failed: %s", attempt + 1, max_retries, e)
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
-        
-        logger.error("❌ All MongoDB attempts failed, falling back to local file")
-        _load_state_from_file()
+        else:
+            logger.error("❌ All MongoDB attempts failed, falling back to local file")
+            _load_state_from_file()
     else:
         _load_state_from_file()
+    
+    # Ensure default groups are added if they don't exist
+    for group_id, group_data in DEFAULT_GROUPS.items():
+        if group_id not in state["groups"]:
+            state["groups"][group_id] = group_data
+            logger.info("✅ Added default group: %s", group_id)
+    
+    # Save state after adding default groups
+    save_state()
 
 def save_state():
     if db is not None:
@@ -185,30 +204,6 @@ def test_mongodb_connection():
         return "✅ MongoDB connection successful"
     except Exception as e:
         return f"❌ MongoDB connection failed: {str(e)}"
-
-def convert_to_standard_uri(srv_uri):
-    """
-    Convert mongodb+srv:// URI to standard mongodb:// URI
-    This avoids SRV DNS lookup issues on Heroku
-    """
-    if not srv_uri.startswith("mongodb+srv://"):
-        return srv_uri
-    
-    try:
-        # Extract components from SRV URI
-        srv_uri = srv_uri.replace("mongodb+srv://", "mongodb://")
-        # Remove the SRV-specific options and add standard port
-        if "?" in srv_uri:
-            base, query = srv_uri.split("?", 1)
-            srv_uri = base + ":27017?" + query
-        else:
-            srv_uri = srv_uri + ":27017"
-        
-        logger.info("🔄 Converted SRV URI to standard URI")
-        return srv_uri
-    except Exception as e:
-        logger.error("❌ Failed to convert SRV URI: %s", e)
-        return srv_uri
 
 # ---------- Message formatting / parsing ----------
 def extract_otp(message: str) -> str:
@@ -374,6 +369,9 @@ async def cmd_removegroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /removegroup <chat_id>")
     chat_id = str(context.args[0])
     if chat_id in state["groups"]:
+        # Don't allow removal of default groups
+        if chat_id in DEFAULT_GROUPS:
+            return await update.message.reply_text("❌ Cannot remove default group")
         state["groups"].pop(chat_id, None)
         save_state()
         return await update.message.reply_text(f"❌ Group {chat_id} removed")
@@ -386,7 +384,8 @@ async def cmd_listgroups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("No groups configured yet")
     lines = []
     for cid, g in state["groups"].items():
-        lines.append(f"{cid} — btn:'{g.get('button_text')}' url:{g.get('button_url')} msgs:{g.get('messages',0)}")
+        group_type = "🔒 DEFAULT" if cid in DEFAULT_GROUPS else "➡️ ADDED"
+        lines.append(f"{group_type} {cid} — btn:'{g.get('button_text')}' url:{g.get('button_url')} msgs:{g.get('messages',0)}")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_setbutton(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -440,9 +439,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if start_time:
         uptime = str(datetime.now(timezone.utc) - start_time).split(".")[0]
     total_msgs = sum([g.get("messages", 0) for g in state["groups"].values()])
+    
+    # Count default vs added groups
+    default_groups = sum(1 for gid in state["groups"] if gid in DEFAULT_GROUPS)
+    added_groups = groups_count - default_groups
+    
     text = (
         f"📊 <b>Bot Status</b>\n\n"
-        f"• Groups configured: <b>{groups_count}</b>\n"
+        f"• Total groups: <b>{groups_count}</b>\n"
+        f"  - Default groups: <b>{default_groups}</b>\n"
+        f"  - Added groups: <b>{added_groups}</b>\n"
         f"• Admins: <b>{admins_count}</b>\n"
         f"• Uptime: <b>{uptime}</b>\n"
         f"• Total messages sent: <b>{total_msgs}</b>\n"
@@ -457,7 +463,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("No groups configured")
     parts = []
     for cid, g in state["groups"].items():
-        parts.append(f"{cid}: {g.get('messages',0)} msgs")
+        group_type = "🔒" if cid in DEFAULT_GROUPS else "➡️"
+        parts.append(f"{group_type} {cid}: {g.get('messages',0)} msgs")
     await update.message.reply_text("📊 Message counts:\n" + "\n".join(parts))
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -559,6 +566,13 @@ async def on_startup(app):
     if MONGO_URI:
         result = test_mongodb_connection()
         logger.info(result)
+    
+    # Log default groups status
+    for group_id in DEFAULT_GROUPS:
+        if group_id in state["groups"]:
+            logger.info("✅ Default group configured: %s", group_id)
+        else:
+            logger.warning("❌ Default group not found: %s", group_id)
 
 # ---------------- Main ----------------
 def main():
