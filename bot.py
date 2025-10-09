@@ -64,9 +64,9 @@ if MONGO_URI:
         # Enhanced connection with better timeout and retry settings
         client = MongoClient(
             MONGO_URI, 
-            serverSelectionTimeoutMS=10000,  # Increased timeout
-            connectTimeoutMS=10000,
-            socketTimeoutMS=10000,
+            serverSelectionTimeoutMS=15000,  # Increased timeout
+            connectTimeoutMS=15000,
+            socketTimeoutMS=15000,
             retryWrites=True,
             appname="otp-bot"
         )
@@ -180,11 +180,35 @@ def test_mongodb_connection():
         parsed = urlparse(MONGO_URI)
         logger.info("🔍 MongoDB host: %s", parsed.hostname)
         
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
         client.server_info()
         return "✅ MongoDB connection successful"
     except Exception as e:
         return f"❌ MongoDB connection failed: {str(e)}"
+
+def convert_to_standard_uri(srv_uri):
+    """
+    Convert mongodb+srv:// URI to standard mongodb:// URI
+    This avoids SRV DNS lookup issues on Heroku
+    """
+    if not srv_uri.startswith("mongodb+srv://"):
+        return srv_uri
+    
+    try:
+        # Extract components from SRV URI
+        srv_uri = srv_uri.replace("mongodb+srv://", "mongodb://")
+        # Remove the SRV-specific options and add standard port
+        if "?" in srv_uri:
+            base, query = srv_uri.split("?", 1)
+            srv_uri = base + ":27017?" + query
+        else:
+            srv_uri = srv_uri + ":27017"
+        
+        logger.info("🔄 Converted SRV URI to standard URI")
+        return srv_uri
+    except Exception as e:
+        logger.error("❌ Failed to convert SRV URI: %s", e)
+        return srv_uri
 
 # ---------- Message formatting / parsing ----------
 def extract_otp(message: str) -> str:
